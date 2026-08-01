@@ -542,3 +542,208 @@ kube-controller-manager (ReplicaSet Controller): Detects that the actual number 
 kube-scheduler: Detects the newly created Pod object (which has no assigned node) and binds it to an optimal worker node.
 
 kubelet: Detects that a Pod has been assigned to its local node, communicates with the local container runtime to pull the image, and starts the container.
+
+------------------------------------------------------------------------------------------------
+# Understanding `maxSurge` and `maxUnavailable` in Kubernetes
+
+When updating a Kubernetes **Deployment** (such as updating a container image version), Kubernetes performs a **Rolling Update** by default. To prevent application downtime during these updates, Kubernetes uses two key strategy fields: **`maxSurge`** and **`maxUnavailable`**.
+
+These two fields control **how fast** an update proceeds and **how much capacity buffer/downtime** is allowed during the update process.
+
+---
+
+## 1. Quick Definitions
+
+| Parameter | What it Controls | Default Value |
+| :--- | :--- | :--- |
+| **`maxSurge`** | The maximum number of **extra Pods** that can be created *above* the desired replica count during an update. | `25%` |
+| **`maxUnavailable`** | The maximum number of **Pods that can be offline/unavailable** relative to the desired replica count during an update. | `25%` |
+
+> 💡 **Key Rule:** Both parameters can be specified either as an **absolute number** (e.g., `2`) or as a **percentage** of the desired replicas (e.g., `25%`).
+
+---
+
+## 2. Deep Dive & Examples
+
+Assume you have a Deployment with **`replicas: 4`**.
+
+### A. `maxSurge` (The Upper Bound / Extra Capacity)
+`maxSurge` defines how many additional Pods Kubernetes can launch temporarily while upgrading.
+
+* **Example with Absolute Number (`maxSurge: 2`):**
+  * Desired Replicas: `4`
+  * Maximum Pods allowed during rollout: `4 + 2 = 6`
+  * **Behavior:** Kubernetes can immediately spin up 2 new version Pods. Once those pass readiness probes, it starts terminating old Pods.
+
+* **Example with Percentage (`maxSurge: 25%`):**
+  * $25\% \text{ of } 4 = 1$
+  * Maximum Pods allowed during rollout: `4 + 1 = 5`
+
+---
+
+### B. `maxUnavailable` (The Lower Bound / Capacity Drop)
+`maxUnavailable` defines how many existing Pods can be destroyed before new replacement Pods are ready and operational.
+
+* **Example with Absolute Number (`maxUnavailable: 1`):**
+  * Desired Replicas: `4`
+  * Minimum healthy Pods required during rollout: `4 - 1 = 3`
+  * **Behavior:** Kubernetes can terminate 1 old Pod immediately, dropping running capacity to 3 while it spins up a new Pod to replace it.
+
+* **Example with Percentage (`maxUnavailable: 25%`):**
+  * $25\% \text{ of } 4 = 1$
+  * Minimum healthy Pods required: `4 - 1 = 3`
+
+---
+
+## 3. How They Work Together: Common Configuration Patterns
+
+How you combine `maxSurge` and `maxUnavailable` in your Deployment manifest depends entirely on your application's resource constraints and availability targets.
+
+### Configuration YAML Spec Location
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-web-app
+spec:
+  replicas: 4
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+  template:
+    ...
+
+# Best Rolling Update Strategy for Production
+
+For production environments, the recommended standard configuration is **Zero-Downtime Rolling Updates**:
+
+```yaml
+spec:
+  replicas: 4
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 0
+
+1. Why maxSurge: 25% and maxUnavailable: 0 is the Gold Standard
+A. Zero Capacity Drop (maxUnavailable: 0)
+Guarantees that 100% of your serving capacity remains available at all times during a rollout.
+
+Existing pods are never terminated until new replacement pods are completely created, initialized, and pass their Readiness Probes.
+
+Prevents traffic overload on remaining pods during peak production load.
+
+B. Controlled Burst (maxSurge: 25% or maxSurge: 1)
+Provisions extra pods in small, controlled batches (e.g., 1 extra pod for a 4-replica setup).
+
+Prevents sudden CPU/Memory spikes on cluster worker nodes while still keeping rollout times fast.
+
+-------------------------------------------------
+kube-scheduler: 
+
+
+The **`kube-scheduler`** is a core component of the Kubernetes Control Plane. Its primary responsibility is **Pod Placement**: watching for newly created Pods that have no assigned worker node and assigning them to the most optimal node in the cluster based on available resources, constraints, and affinity rules.
+
+---
+
+## 1. Role & High-Level Architecture
+
+```text
+  +-----------------------+
+  |  New Pod Created      |  (nodeName: "")
+  |  and written to etcd  |
+  +-----------------------+
+              |
+              v
+  +---------------------------------------------------------------------------------+
+  |                                 KUBE-SCHEDULER                                  |
+  |                                                                                 |
+  |   1. Filtering (Predicates)  ──>  2. Scoring (Priorities)  ──>  3. Binding      |
+  |   (Find Feasible Nodes)           (Rank Eligible Nodes)         (Assign Node)   |
+  +---------------------------------------------------------------------------------+
+                                          |
+                                          v
+                              +-----------------------+
+                              |  Update kube-apiserver|  (nodeName: "node-01")
+                              |  (Persist to etcd)    |
+                              +-----------------------+
+
+Key Responsibilities
+Monitors Unschedulable Pods: Continuously watches kube-apiserver for Pods where spec.nodeName is empty.
+
+Optimal Placement: Finds the best fit for a Pod rather than assigning it to a random node.
+
+Does NOT Execute Pods: kube-scheduler only assigns the node name (spec.nodeName) in the Pod manifest. It is the worker node's kubelet agent that detects this binding and actually runs the containers.
+
+2. The 2-Phase Scheduling Process: Filtering & Scoring
+When scheduling a Pod, kube-scheduler evaluates all worker nodes in the cluster through a two-phase pipeline:
+
+Phase 1: Filtering (Predicates)
+Filters out nodes that cannot run the Pod due to physical or logical constraints. If no nodes pass this phase, the Pod remains in a Pending state.
+
+Common Filtering Checks:
+
+PodFitsResources: Does the node have enough unallocated CPU and RAM to satisfy the Pod's resources.requests?
+
+NodeName / NodeSelector: Does the node match specific labels or the explicit node name specified in the Pod spec?
+
+TaintsAndTolerations: Does the node have a Taint that the Pod lacks a matching Toleration for?
+
+NodeAffinity: Does the node satisfy requiredDuringSchedulingIgnoredDuringExecution rules?
+
+VolumeZone / VolumeNode: Is the required persistent volume (e.g., EBS volume, Azure Disk) physically accessible from this node's availability zone?
+
+Phase 2: Scoring (Priorities)
+Ranks all nodes that passed the Filtering phase to determine the absolute best node for the Pod. Each node receives a score (typically 0 to 100), and the node with the highest score is selected.
+
+Common Scoring Rules:
+
+LeastRequestedPriority: Favors nodes with lower CPU/Memory utilization to balance workloads across the cluster.
+
+MostRequestedPriority: Favors nodes with higher utilization (useful for auto-scaling clusters to pack nodes tightly and scale down empty ones).
+
+ImageLocalityPriority: Favors nodes that already have the required container images pre-cached locally.
+
+NodeAffinityPriority / PodTopologySpread: Favors nodes matching preferred affinity rules or spread constraints to maintain high availability.
+
+Phase 3: Binding
+Once the winning node is selected, kube-scheduler creates a Binding object via an API call to kube-apiserver, updating the Pod's spec.nodeName. The kubelet on that node then receives the update and spawns the containers.
+
+
+
+4. Top Interview Questions & Detailed Answers
+Q1: What is the main role of kube-scheduler in a Kubernetes cluster?
+Answer: The kube-scheduler is responsible for selecting an optimal worker node for unscheduled Pods. It continuously checks for Pods without an assigned node (nodeName: ""), runs them through a Filtering (Predicates) and Scoring (Priorities) pipeline, and binds the winning node to the Pod by updating spec.nodeName via kube-apiserver.
+
+Q2: Does kube-scheduler physically start containers on the worker node?
+Answer: No. kube-scheduler only decides where the Pod should run and updates the Pod spec with the selected node's name. The kubelet agent running on that specific worker node detects the assignment, calls the local Container Runtime (containerd), and handles container provisioning.
+
+Q3: What happens when a Pod stays in a Pending state with the event 0/N nodes are available?
+Answer: This indicates that all nodes failed the Filtering (Predicates) phase. Common root causes include:
+
+Insufficient Resources: No single node has enough available unallocated CPU or Memory to satisfy the Pod's requests.
+
+Unmatched Taints: Nodes have taints that the Pod lacks matching tolerations for.
+
+Unmatched NodeSelectors/Affinity: No nodes match the required label selectors or affinity constraints in the Pod spec.
+
+Unsatisfied PVC / Volume Binding: The Pod relies on a PersistentVolume bound to an availability zone where no nodes are available.
+
+Q4: What is the difference between Taints/Tolerations and Node Affinity?
+Answer:
+
+Node Affinity is a Pod-centric property that attracts Pods to a specific set of nodes based on node labels.
+
+Taints & Tolerations are Node-centric properties where nodes repel Pods. A node with a taint rejects all Pods unless the Pod explicitly has a matching toleration.
+
+Q5: What is Pod Preemption and PriorityClass?
+Answer: When a high-priority Pod cannot be scheduled due to a lack of node resources, kube-scheduler can preempt (evict) lower-priority Pods from a node to free up capacity. This behavior is configured using a PriorityClass object, which assigns a numerical value to Pods. High-priority Pods take precedence over low-priority Pods during scheduling bottlenecks.
+
+Q6: How does kube-scheduler handle High Availability (HA)?
+Answer: Like kube-controller-manager, kube-scheduler operates in an Active-Passive (Leader-Follower) model using Kubernetes Lease locks. Multiple instances run across control plane nodes, but only one active Leader executes the scheduling algorithm to prevent dual-assignment race conditions. Secondary instances remain idle and take over if the leader fails.
+
+Q7: Can you run multiple schedulers or a custom scheduler in the same cluster?
+Answer: Yes. Kubernetes supports Multiple Schedulers. You can deploy a custom scheduler alongside the default kube-scheduler and specify schedulerName: custom-scheduler in a Pod's manifest. The default scheduler ignores Pods assigned to other scheduler names, allowing your custom binary to manage their placement logic.
