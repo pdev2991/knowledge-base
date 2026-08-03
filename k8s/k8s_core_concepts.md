@@ -712,7 +712,7 @@ NodeAffinityPriority / PodTopologySpread: Favors nodes matching preferred affini
 Phase 3: Binding
 Once the winning node is selected, kube-scheduler creates a Binding object via an API call to kube-apiserver, updating the Pod's spec.nodeName. The kubelet on that node then receives the update and spawns the containers.
 
-
+-----------------------------------------------------
 
 4. Top Interview Questions & Detailed Answers
 Q1: What is the main role of kube-scheduler in a Kubernetes cluster?
@@ -747,3 +747,387 @@ Answer: Like kube-controller-manager, kube-scheduler operates in an Active-Passi
 
 Q7: Can you run multiple schedulers or a custom scheduler in the same cluster?
 Answer: Yes. Kubernetes supports Multiple Schedulers. You can deploy a custom scheduler alongside the default kube-scheduler and specify schedulerName: custom-scheduler in a Pod's manifest. The default scheduler ignores Pods assigned to other scheduler names, allowing your custom binary to manage their placement logic.
+
+
+-----------------------------------------------------------------------
+
+Kubelet :
+
+
+The **`kubelet`** is the primary, essential worker node agent in Kubernetes. It runs on **every single node** (both Worker Nodes and Control Plane Nodes) inside the cluster. 
+
+While components like the `kube-scheduler` decide *where* a Pod should run, the `kubelet` is the component actually responsible for making sure containers are running, healthy, and configured correctly on the physical or virtual host.
+
+---
+
+## 1. Core Architecture & High-Level Responsibilities
+
+```text
+                                [ Control Plane ]
+                                       |
+                             ( kube-apiserver )
+                                       |
+                         +-------------+-------------+
+                         |  Watches PodSpecs assigned|
+                         |  to its specific Node     |
+                         v                           v
+     +-----------------------------------------------------------------------+
+     |                              WORKER NODE                              |
+     |                                                                       |
+     |   +---------------------------------------------------------------+   |
+     |   |                            KUBELET                            |   |
+     |   |                                                               |   |
+     |   |   1. PodSync Loop       (Reads PodSpec & maintains desired)   |   |
+     |   |   2. CNI Interface      (Configures pod network namespaces)   |   |
+     |   |   3. CSI Interface      (Mounts volumes/PVs into container)   |   |
+     |   |   4. Health Probes      (Liveness, Readiness, Startup)        |   |
+     |   |   5. Node Status Sync   (Reports CPU, RAM, & status to API)   |   |
+     |   +---------------------------------------------------------------+   |
+     |                                   |                                   |
+     |                    gRPC / CRI (Container Runtime Interface)           |
+     |                                   v                                   |
+     |   +---------------------------------------------------------------+   |
+     |   |                      CONTAINER RUNTIME                        |   |
+     |   |                   (containerd / CRI-O)                        |   |
+     |   +---------------------------------------------------------------+   |
+     |                                   |                                   |
+     |                                   v                                   |
+     |                         [ Running Containers ]                        |
+     +-----------------------------------------------------------------------+
+
+     
+Key Responsibilities :
+
+Pod Lifecycle Management: Translates high-level declarative PodSpecs into low-level runtime container creation, restart, and termination operations.
+
+Node Health & Status Reporting: Periodically sends node status updates, capacity metrics, and health heartbeats back to kube-apiserver.
+
+Health Probing: Executes livenessProbe, readinessProbe, and startupProbe checks against application containers.
+
+Volume & Network Attachment: Interfaces with CSI (Container Storage Interface) to attach/mount storage volumes and CNI (Container Network Interface) to assign IP addresses.
+
+Resource Enforcement (cgroups): Interacts with Linux Kernel cgroups and namespaces to enforce CPU/Memory limits and requests specified in the Pod manifest.
+
+
+Key Interfaces Managed by kubelet :
+The kubelet acts as an orchestrator on the node level by coordinating three standardized plugin interfaces:
+
+CRI : Container Runtime Interface	gRPC protocol used by kubelet to talk to container engines (containerd, CRI-O) without needing hardcoded runtime code.
+CNI	: Container Network Interface	Plugin specification used to allocate network interfaces, IP addresses, and routes for newly spawned Pods (e.g., Calico, Cilium, Flannel).
+CSI :  Container Storage Interface	Plugin specification used to mount local or cloud storage volumes (AWS EBS, Azure Disk, NFS) directly into container file systems.
+
+
+3. The Sync Loop: How kubelet Works Internally
+The core mechanism of kubelet is an event-driven loop called the Sync Loop (PodSync):
+
+Fetch State: It receives PodSpecs from multiple sources:
+
+kube-apiserver (Primary): Active watch stream of Pods assigned to its node (spec.nodeName == local_node).
+
+Static Pod Directory (Local Files): Inspects /etc/kubernetes/manifests/ for local system manifests (used to bootstrap control plane components like etcd or kube-apiserver).
+
+HTTP Endpoint: Optional URL for fetching remote specs.
+
+Compare State: It queries the local container runtime (via CRI) to inspect what containers are currently running.
+
+Reconcile: If a container died or is missing, kubelet calls CRI to pull the required image and start the container. If a Pod spec changed, it restarts or updates the container accordingly.
+
+
+4. kubelet Health Checks & Node Eviction
+A. Probes Managed by kubelet
+Startup Probe: Checks if the application inside the container has started up. All other probes are disabled until this succeeds.
+
+Liveness Probe: Checks if the container is still alive. If this fails, kubelet kills and restarts the container according to its restartPolicy.
+
+Readiness Probe: Checks if the container is ready to accept incoming user traffic. If this fails, kubelet notifies kube-apiserver to remove the Pod IP from Service Endpoints.
+
+B. Node Pressure Eviction
+When a node runs low on system resources (disk space, memory, or PID counts), kubelet proactively evicts Pods to prevent node crashes.
+
+[ System Memory/Disk Drop Below Threshold ]
+                       |
+                       v
+     [ Kubelet Triggers Eviction Signal ]
+                       |
+                       v
+     [ Soft/Hard Eviction Threshold Exceeded ]
+                       |
+                       v
+   [ Kubelet Reclaims Space / Evicts Pods ]
+
+   Eviction Thresholds: Configured via flags such as --eviction-hard=memory.available<100Mi,nodefs.available<10%.
+
+
+Eviction Order: kubelet selects Pods for eviction based on:
+
+Pods exceeding their requested resources (resources.requests).
+
+Pod Quality of Service (QoS) Class:
+
+BestEffort (First to be evicted): Pods with no limits or requests set.
+
+Burstable (Second to be evicted): Pods where requests are lower than limits.
+
+Guaranteed (Last to be evicted): Pods where requests equal limits for both CPU and Memory.
+
+
+Q1: What is the main difference between kubelet and kube-proxy on a Worker Node?
+Answer:
+
+kubelet is responsible for workload lifecycle and node management. It manages container creation, health probes, storage mounting, and reports node status.
+
+kube-proxy is strictly responsible for node-level networking rules. It maintains iptables, IPVS, or eBPF rules to route service traffic to target Pod IPs across the cluster.
+
+Q2: What are Static Pods, and how does the kubelet manage them?
+Answer: Static Pods are Pods managed directly by the kubelet on a specific node without passing through the kube-apiserver or kube-scheduler.
+
+The kubelet watches a local host directory (typically /etc/kubernetes/manifests/).
+
+Any YAML file placed in this directory is automatically launched as a Pod by the local kubelet.
+
+Use Case: Used to bootstrap control plane components (kube-apiserver, etcd, kube-scheduler) on self-hosted Kubernetes clusters (e.g., set up via kubeadm).
+
+Q3: How does kubelet communicate with container engines like containerd?
+Answer: kubelet communicates with container engines via the Container Runtime Interface (CRI) using gRPC over a UNIX domain socket (e.g., /run/containerd/containerd.sock). This decouples kubelet from specific container engines, allowing it to work seamlessly with containerd, CRI-O, or any CRI-compliant runtime.
+
+Q4: What happens if the kubelet service crashes or stops on a worker node?
+Answer:
+
+Container Status: Existing running application containers on that node continue running because container processes are managed independently by the underlying container runtime (containerd).
+
+Loss of Management: kubelet stops sending node heartbeats to kube-apiserver, cannot process new Pod assignments, and stops executing health probes.
+
+Control Plane Response: After node-monitor-grace-period (default ~40s), kube-apiserver marks the node as NotReady. After pod-eviction-timeout (default ~5m), the kube-controller-manager schedules replacement Pods onto other healthy nodes.
+
+Q5: How does kubelet decide which Pods to evict first when a node runs out of Memory (OOM / Node Pressure)?
+Answer: kubelet ranks Pods for eviction based on their Quality of Service (QoS) Class and resource usage:
+
+BestEffort Pods (no requests or limits defined) are evicted first.
+
+Burstable Pods (requests < limits) that are exceeding their requested memory are evicted second.
+
+Guaranteed Pods (requests == limits for all containers) are evicted last, and only if system critical processes are threatened.
+
+Q6: What is the difference between a LivenessProbe failure and a ReadinessProbe failure as handled by kubelet?
+Answer:
+
+Liveness Probe Failure: kubelet kills the container and restarts it according to the Pod's restartPolicy.
+
+Readiness Probe Failure: kubelet does not kill the container. Instead, it reports to kube-apiserver that the Pod is not ready, causing the Endpoints Controller to remove the Pod's IP from Service endpoints so no new traffic is routed to it until it recovers.
+
+Q7: Where are kubelet logs stored, and how do you troubleshoot a failing node?
+Answer: Since kubelet runs directly as a system daemon on the host OS (not inside a container), its logs are inspected using journalctl:
+
+Bash
+# Check real-time kubelet logs
+journalctl -u kubelet -f
+
+# Check recent kubelet error logs
+journalctl -u kubelet -e --no-pager
+Troubleshooting steps for a failing node include checking journalctl -u kubelet, verifying CRI runtime status (systemctl status containerd), checking disk usage (df -h), and checking system memory pressure (free -m).
+
+
+----------------------------------------------------------
+
+Requests vs. Limits : 
+# Understanding CPU and Memory Requests vs. Limits in Kubernetes
+
+In Kubernetes, **Requests** and **Limits** are the mechanisms used to control how much CPU and Memory (RAM) a container can consume on a worker node. 
+
+Setting resource requests and limits properly is critical to ensuring application performance, preventing **OOMKilled** (Out Of Memory) crashes, and helping the `kube-scheduler` place workloads efficiently.
+
+---
+
+## 1. Quick Definitions
+
+| Resource Metric | Definition | Analogy |
+| :--- | :--- | :--- |
+| **`requests`** | The **guaranteed minimum** amount of CPU or Memory Kubernetes reserves for a container. The `kube-scheduler` uses this number to decide which node has enough space to host the Pod. | **Table Reservation:** The minimum size table guaranteed for your party at a restaurant. |
+| **`limits`** | The **absolute maximum** amount of CPU or Memory a container is allowed to consume. | **Credit Card Limit:** The hard ceiling you cannot cross, no matter how much you want to spend. |
+
+---
+
+## 2. Resource Units Explained
+
+Before setting values, it is important to understand how Kubernetes measures CPU and Memory:
+
+### A. CPU Measurement (Cores & Millicores)
+CPU is measured in **Kubernetes Compute Units** (vCPUs / Cores).
+* `1` CPU = 1 vCPU / 1 Core (e.g., 1 AWS vCPU, 1 GCP vCPU, or 1 Hyperthread on bare metal).
+* **Millicores (`m`):** CPU is fractional and often expressed in millicores:
+  * `1000m` = `1 CPU`
+  * `500m` = `0.5 CPU` (50% of 1 CPU core)
+  * `250m` = `0.25 CPU` (25% of 1 CPU core)
+
+### B. Memory Measurement (Bytes)
+Memory is measured in bytes, commonly expressed using **Binary Megabytes / Gigabytes**:
+* **`Mi` (Mebibytes):** $1 \text{ Mi} = 1024 \times 1024 \text{ bytes}$ (Standard base-2 byte notation)
+* **`Gi` (Gibibytes):** $1 \text{ Gi} = 1024 \text{ Mi}$
+* *(Avoid using `M` or `G` which are decimal/base-10; always use `Mi` and `Gi` in YAMLs).*
+
+---
+
+## 3. Practical Example with YAML Manifest
+
+Here is an example Deployment manifest defining CPU and Memory requests and limits for a web application container:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-api
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+      - name: api-server
+        image: nginx:latest
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"      # 0.25 CPU cores
+          limits:
+            memory: "512Mi"
+            cpu: "500m"      # 0.50 CPU cores
+
+
+What This Example Means in Practice:
+Scheduling (Requests):
+
+The kube-scheduler searches for a node that has at least 250m CPU and 256Mi RAM of unallocated capacity.
+
+If a node has 8 GB of total RAM but 7.8 GB is already reserved by requests from other pods, this new pod will not be scheduled on that node—even if actual current usage is low.
+
+Normal Operation (Between Requests & Limits):
+
+The container starts with a guaranteed 250m CPU and 256Mi RAM.
+
+If traffic spikes, the container can temporarily burst up to 500m CPU and 512Mi RAM as long as spare capacity exists on the host node.
+
+Exceeding Limits (What Happens When Limits Are Hit?):
+
+CPU (Throttled): CPU is a compressible resource. If the container tries to exceed 500m CPU, Kubernetes (via Linux cgroups) will throttle the container's CPU allocation. The application will run slower, but it will not be killed.
+
+Memory (Killed): Memory is an incompressible resource. If the container attempts to allocate more than 512Mi of RAM, the Linux Kernel's Out-Of-Memory killer triggers, and kubelet terminates the container with an OOMKilled (Exit Code 137) status. kubelet will then restart it according to its restartPolicy.
+
+
+-----------------------------------------------------------
+kube-proxy : 
+
+
+**`kube-proxy`** is a core networking component that runs as a daemon (typically as a `DaemonSet`) on **every single node** inside a Kubernetes cluster. 
+
+While components like the `kubelet` manage container lifecycles and the CNI (Container Network Interface) assigns IP addresses to individual Pods, **`kube-proxy` is strictly responsible for implementing the Kubernetes `Service` abstraction**. It enables virtual IP (ClusterIP) routing and load balancing across a dynamic set of backend Pods.
+
+---
+
+## 1. Core Architecture & High-Level Role
+
+```text
+  [ Incoming Client Traffic / Request ]
+                   |
+                   v
+  +-----------------------------------------------------------------------+
+  |                              WORKER NODE                              |
+  |                                                                       |
+  |   +-----------------------+     Watches Services &    +-----------+   |
+  |   |    kube-apiserver     | ------------------------> | kube-proxy|   |
+  |   +-----------------------+      Endpoints via API    +-----------+   |
+  |                                                             |         |
+  |                                                             v         |
+  |                                                  Translates specs into|
+  |                                                  Node Kernel Rules    |
+  |                                                             |         |
+  |                                                             v         |
+  |                                                  +--------------------+
+  |                                                  | Kernel Netfilter   |
+  |                                                  | (iptables / IPVS)  |
+  |                                                  +--------------------+
+  |                                                             |         |
+  |                                                             v         |
+  |  +-----------------------------------------------------------------+  |
+  |  |                 Routes directly to Target Pod IPs               |  |
+  |  |                                                                 |  |
+  |  |      [ Pod A (10.244.1.5) ]      [ Pod B (10.244.1.6) ]           |  |
+  |  +-----------------------------------------------------------------+  |
+  +-----------------------------------------------------------------------+
+Key Responsibilities:
+
+Service Virtual IP (VIP) Routing: Translates abstract, immutable Service Virtual IPs (ClusterIP, NodePort) into the actual, dynamic IP addresses of healthy target Pods.
+
+Cluster Load Balancing: Distributes incoming connections across matching backend Pods for a given Service.
+
+Control Plane Synchronization: Continuously watches the kube-apiserver for updates to Service and Endpoints / EndpointSlice objects.
+
+Kernel Rule Manipulation: Translates Kubernetes Service definitions directly into low-level Linux networking rules (using iptables, IPVS, or eBPF).
+
+
+2. kube-proxy Proxying Modes
+kube-proxy can operate in three main modes. Understanding their differences is crucial for performance tuning and interview discussions:
+
++----------------------------------------------------+
+                  |               KUBE-PROXY MODES                     |
+                  +----------------------------------------------------+
+                   /                         |                        \
+                  v                          v                         v
+       +--------------------+      +--------------------+     +--------------------+
+       |   User space       |      |      iptables      |     |        IPVS        |
+       |  (Legacy/Obsolete) |      | (Default Standard) |     | (High Performance) |
+       +--------------------+      +--------------------+     +--------------------+
+
+A. iptables Mode (Default Standard)How it Works: kube-proxy writes sequential iptables rules into the Linux kernel netfilter subsystem for every Service and Endpoint. When traffic hits a ClusterIP, the Linux kernel randomly selects a backend Pod IP based on probability rules.Pros: Stable, widely supported, native to Linux.Cons: Scalability bottlenecks. iptables evaluates rules sequentially ($\mathcal{O}(N)$ complexity). In large clusters with thousands of Services and Pods (e.g., 20,000+ rules), updating or matching iptables rules incurs high CPU overhead and packet processing delays.
+
+B. IPVS Mode (IP Virtual Server - Recommended for Large Clusters)How it Works: Built on the Netfilter hook within the Linux kernel, IPVS uses hash tables ($\mathcal{O}(1)$ complexity) to store routing rules instead of sequential lists.Pros: High performance and minimal latency degradation in large clusters (10,000+ Services). Supports advanced load-balancing algorithms (Round-Robin, Least Connections, Source Hashing, Destination Hashing).Cons: Requires additional Linux kernel modules (ip_vs, ip_vs_rr, etc.) installed on all host worker nodes.
+
+C. Userspace Mode (Legacy / Deprecated)How it Works: kube-proxy opens a port in user space on the host. Traffic travels from kernel space $\rightarrow$ user space (kube-proxy) $\rightarrow$ kernel space $\rightarrow$ target Pod.Cons: Extremely slow due to continuous context switching between kernel space and user space for every packet. Obsolete in modern clusters.💡 Modern Alternative (eBPF / Cilium): Many modern platforms bypass kube-proxy entirely using eBPF-based CNI plugins like Cilium (kube-proxy-replacement=true), which route packets directly within kernel socket layers with zero iptables overhead.
+
+
+3. How kube-proxy Handles Service Types
+
+ClusterIP   	Creates internal kernel rules mapping the Service IP (e.g., 10.96.0.10:80) to active Pod IPs (e.g., 10.244.1.15:8080).
+
+NodePort	Opens a high-range port (30000–32767) on every Worker Node's physical IP address and creates routing rules directing that port to the underlying ClusterIP and Pod endpoints.
+
+LoadBalancer	Relies on cloud-controller-manager to provision an external cloud load balancer (e.g., AWS ALB/NLB), which forwards incoming external traffic to the NodePort rules maintained by kube-proxy.
+
+
+---------------------------------------------------
+Top DevOps & Platform Engineering Interview Questions
+Q1: What is the primary role of kube-proxy in a Kubernetes cluster?
+Answer: kube-proxy is a network agent running on each node that implements the Kubernetes Service abstraction. It watches the kube-apiserver for changes to Services and Endpoints/EndpointSlices, updating local Linux kernel routing tables (iptables or IPVS) to route traffic sent to virtual IPs (ClusterIP, NodePort) directly to healthy backend Pod IPs.
+
+
+Q2: What is the difference between kube-proxy and a CNI (Container Network Interface) plugin like Calico or Flannel?
+Answer:
+
+CNI (Network Plugin): Responsible for Pod-to-Pod connectivity. It creates network interfaces, assigns IP addresses to Pods, and ensures Pod A on Node 1 can ping Pod B on Node 2.
+
+kube-proxy: Responsible for Service-to-Pod load balancing. It manages the virtual layer above Pods, taking traffic sent to a static Service IP and routing/load-balancing it across dynamic, short-lived Pod IPs provided by the CNI.
+
+
+Q3: Why does iptables mode in kube-proxy suffer from scaling issues in large clusters?Answer: iptables rules are evaluated sequentially ($\mathcal{O}(N)$ lookup time). As a cluster grows to thousands of Services and tens of thousands of Pod endpoints:Every packet must evaluate a massive list of sequential rules, causing CPU overhead and network latency.Every time a single Pod is created or deleted, kube-proxy must rewrite and re-read large chunks of the iptables rule table, causing heavy lock contention in the Linux kernel.
+
+
+Q4: How does IPVS mode overcome the limitations of iptables mode?Answer: IPVS uses hash tables ($\mathcal{O}(1)$ lookup time) instead of sequential lists. Packet lookup speed remains constant regardless of whether the cluster has 10 Services or 10,000 Services. Furthermore, IPVS supports advanced load balancing algorithms (like Least Connections or Source Hashing), whereas iptables only supports basic random probability.
+
+Q5: What is externalTrafficPolicy: Local and how does it affect kube-proxy behavior?
+Answer: By default (externalTrafficPolicy: Cluster), when traffic hits a NodePort on Node A, kube-proxy may route that traffic to a Pod running on Node B, incurring an extra network hop (SNAT/cross-node latency).
+
+When set to Local, kube-proxy forces the node to route traffic only to Pods running locally on that exact node.
+
+Pros: Preserves the client's real source IP address (no SNAT) and eliminates extra network hops.
+
+Cons: If Node A has no running local Pods for that Service, traffic sent to Node A is dropped.
+
+
+Q6: What happens if kube-proxy crashes or stops running on a worker node?
+Answer:
+
+Existing Traffic: Already established network connections and existing iptables/IPVS rules stored in the host Linux kernel continue to work temporarily.
+
+Dynamic Breakage: Because kube-proxy is inactive, it stops receiving updates from kube-apiserver. If Pods scale up, scale down, or crash, kernel routing rules will not be updated, leading to traffic being sent to dead Pod IPs or new Pods being ignored
+
+
+Q7: Can a Kubernetes cluster run without kube-proxy?
+Answer: Yes. Modern eBPF-based networking solutions like Cilium can run in kube-proxy-replacement mode. They hook directly into Linux kernel sockets using eBPF programs, intercepting and routing Service traffic with higher performance and lower overhead than kube-proxy.
