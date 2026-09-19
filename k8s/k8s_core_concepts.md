@@ -1293,4 +1293,5 @@ spec:
     ports:
     - containerPort: 80
 
-    
+------------------------
+replicaset     
