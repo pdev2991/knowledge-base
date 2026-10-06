@@ -1678,3 +1678,146 @@ Simultaneously, the kubelet sends SIGTERM to the container.
 The Race Condition: If iptables updates take 2–3 seconds across worker nodes, incoming packets may still be sent to the old pod after it receives SIGTERM, causing 502 Bad Gateway or connection resets.
 
 Solution: Introduce a preStop sleep hook (e.g., sleep 10) to allow iptables rules to propagate fully before the application stops accepting new connections and flushes inflight requests.
+
+-----------------------------------------------------------------------
+Services: 
+
+Kubernetes Services: Overview & NodePortA Kubernetes Service provides an abstraction that defines a logical set of Pods and an access policy to route network traffic to them. Because Pods are ephemeral with dynamic, non-durable IP addresses, Services introduce stable virtual IPs, DNS names, and automated load balancing to decouple internal microservice communication and route external ingress traffic.1. Network Topology & Traffic Flow (NodePort)When exposing a workload externally via a NodePort Service, Kubernetes binds the specified high-order port across all worker nodes in the cluster.       External Client (Laptop / Browser)
+                     |
+        Request to Node IP on NodePort
+         http://192.168.1.2:30008
+                     |
+                     v
++-------------------------------------------------------------+
+| WORKER NODE 1 (IP: 192.168.1.2)                             |
+|                                                             |
+|   NodePort :30008                                           |
+|          │                                                  |
+|          ▼                                                  |
+|   [kube-proxy / iptables] ─── ClusterIP (:80)               |
+|          │                                                  |
+|     ┌────┴──────────────────────────┐                       |
+|     │ (Local Pod)                   │ (Forward to Node 2)   |
+|     ▼                               ▼                       |
+|  +--------------------+      +───────────────────────────+  |
+|  | Pod 1 (10.244.0.2) |      | WORKER NODE 2             |  |
+|  | TargetPort: 80     |      |                           |  |
+|  +--------------------+      |   +--------------------+  |  |
+|                              |   | Pod 2 (10.244.1.5) |  |  |
+|                              |   | TargetPort: 80     |  |  |
+|                              |   +--------------------+  |  |
+|                              +───────────────────────────+  |
++-------------------------------------------------------------+
+Key Ports Explained
+targetPort: The port on which the container application process listens inside the Pod (e.g., Nginx listening on port 80). Defaults to port if omitted.
+port: The internal virtual port exposed by the Service abstraction inside the cluster network (accessible via the Service's ClusterIP).
+nodePort: The port opened on every cluster node's external network interface.Default Range: 30000–32767If not explicitly specified, Kubernetes automatically assigns a free port from this range.2. Core Service TypesTypeTarget AccessMechanismDefault?ClusterIPInternal OnlyAssigns a stable virtual IP reachable only within the cluster boundaries.YesNodePortExternal & InternalExposes a static port (30000–32767) on each Node IP; builds on top of ClusterIP.NoLoadBalancerExternalIntegrates with cloud provider APIs (AWS NLB/ALB, GCP Cloud LB) to route public traffic to the NodePort.No3. NodePort Manifest SpecificationThe binding between a Service and its backend Pods is established using Labels and Selectors.YAMLapiVersion: v1
+
+kind: Service
+metadata:
+  name: myapp-service
+spec:
+  type: NodePort
+  ports:
+    - targetPort: 80     # Container port inside the Pod
+      port: 80           # Service cluster-internal port
+      nodePort: 30008    # Node port accessible externally (30000-32767)
+      protocol: TCP      # Default protocol
+  selector:
+    app: myapp
+    type: front-end
+Corresponding Pod SpecificationYAMLapiVersion: v1
+kind: Pod
+metadata:
+  name: myapp-pod
+  labels:
+    app: myapp
+    type: front-end     # Must match the Service spec.selector exactly
+spec:
+  containers:
+    - name: nginx-container
+      image: nginx
+      ports:
+        - containerPort: 80
+
+4. Operational Commands & VerificationCreate Service
+kubectl create -f service-definition.yml
+List and Inspect ServicesBashkubectl get services
+# Alias: kubectl get svc
+Sample Output:PlaintextNAME            TYPE        CLUSTER-IP       EXTERNAL-IP   PORT(S)        AGE
+kubernetes      ClusterIP   10.96.0.1        <none>        443/TCP        16d
+myapp-service   NodePort    10.106.127.123   <none>        80:30008/TCP   5m
+Inspect Backend Endpoint ResolutionUnder the hood, a Service tracks healthy pods via an Endpoints (or modern EndpointSlice) object created automatically by the Endpoints Controller:Bash
+
+kubectl get endpoints myapp-service
+
+# Or inspect EndpointSlices
+kubectl get endpointslices -l kubernetes.io/service-name=myapp-service
+Sample Output:PlaintextNAME            ENDPOINTS                               AGE
+myapp-service   10.244.0.2:80,10.244.1.5:80             5m
+Test External AccessBashcurl http://<ANY-NODE-IP>:30008
+
+5. Top 5 Platform Engineering Interview Questions: Kubernetes Services
+Q1: How does a NodePort service route traffic to Pods on other nodes, and what is the operational impact of spec.externalTrafficPolicy?
+Answer:
+Default Behavior (Cluster):
+
+Traffic sent to <Node-A-IP>:<NodePort> can be routed by kube-proxy via SNAT (Source Network Address Translation) across the CNI overlay network to a Pod running on Node B.
+
+Trade-off: Distributes traffic evenly across all pods, but introduces an extra network hop and obscures the client's original IP address (SNAT overwrites the source IP with the node's internal IP).
+
+Local Policy (spec.externalTrafficPolicy: Local):
+
+kube-proxy drops packets or refuses traffic on nodes that do not host a live, healthy Pod matching the selector.
+
+Advantages: Avoids the secondary cross-node network hop and preserves the client source IP.
+
+Trade-off: Risks uneven load distribution (nodes with more Pods take disproportionately higher traffic per node), and external load balancers must execute health checks against each node's healthCheckNodePort to avoid routing to nodes without active pods.
+
+Q2: What is the underlying data path for a Service ClusterIP? Why is a ClusterIP not pingable via ICMP?
+Answer:
+The Mechanism:
+
+A ClusterIP is an entirely virtual IP address. There is no physical or virtual network interface (eth0, veth, tun) assigned this IP on any machine or container in the cluster.
+
+Why ICMP Fails:
+
+kube-proxy programs packet translation rules directly into the Linux kernel using iptables or IPVS (or eBPF with Cilium).
+
+These rules are configured specifically to intercept L4 TCP and UDP transport protocols on the specified port.
+
+Because ICMP is an L3 network-layer protocol with no concept of TCP/UDP ports, standard ping packets bypass the packet rewriting rules, finding no route or response host, and fail.
+
+Q3: How do Kubernetes Services discover and track Pods under the hood? What happens if you define a Service without a selector?
+Answer:
+Standard Discovery:
+
+When a Service defines spec.selector, the core endpoint-controller queries Pods matching those labels.
+
+For each matching Pod in the Ready state (evaluated by readiness probes), the controller dynamically provisions and updates an Endpoints and EndpointSlice resource.
+
+Headless / Selectorless Service:
+
+If you define a Service without a spec.selector, Kubernetes creates the Service object but does not automatically generate Endpoints.
+
+Platform Use Cases:
+
+Connecting to External Databases/SaaS: You manually create an Endpoints object with the same name containing the external IP addresses (e.g., an external Oracle DB or legacy VM).
+
+CNAME Aliasing (ExternalName): Mapping an internal DNS name to an external Fully Qualified Domain Name (e.g., api.stripe.com or AWS RDS endpoint).
+
+Q4: What is the difference between Endpoints and EndpointSlices, and why were EndpointSlices introduced in large-scale platforms?
+Answer:
+The Problem with Endpoints at Scale:
+
+A traditional Endpoints object stores all backend Pod IP:port references inside a single API resource.
+
+In large clusters where a Deployment scales to thousands of Pods, every single Pod lifecycle event (startup, termination, probe failure) forces the kube-apiserver to serialize, transfer, and rewrite the entire multi-megabyte Endpoints object, creating severe etcd write amplification and saturating control plane bandwidth.
+
+The EndpointSlice Solution:
+
+EndpointSlices partition backend endpoints into distinct, scalable chunks (default: maximum 100 endpoints per slice).
+
+When a single Pod updates, only the specific EndpointSlice containing that endpoint is rewritten and transmitted, significantly reducing API server load, etcd churn, and network overhead in large-scale platform deployments.
+
+
